@@ -169,7 +169,6 @@ class SubtitleDownloaderApp:
         def _update():
             try:
                 vals = list(self.tree.item(item_id, 'values'))
-                # ensure list length
                 while len(vals) < 4:
                     vals.append("")
                 if status is not None:
@@ -182,6 +181,70 @@ class SubtitleDownloaderApp:
             except Exception:
                 pass
         self.root.after(1, _update)
+
+    def _list_subs(self, folder):
+        """All subtitle files in folder with mtime."""
+        out = []
+        try:
+            for name in os.listdir(folder):
+                if name.lower().endswith((".srt", ".ass", ".ssa")):
+                    full = os.path.join(folder, name)
+                    out.append((os.path.getmtime(full), full))
+        except Exception:
+            pass
+        out.sort(reverse=True)
+        return out
+
+    def _snapshot_set(self, folder):
+        """Set of existing subtitle file paths at a moment in time."""
+        return {p for _, p in self._list_subs(folder)}
+
+    def _recent_after_save(self, before_set, folder, seconds_window=120):
+        """
+        Return plausible newly-saved files.
+        If diff is empty (e.g. overwrite), fallback to 'recent by mtime within window'.
+        """
+        after_list = self._list_subs(folder)
+        after_set = {p for _, p in after_list}
+        diff = sorted(after_set - before_set, key=lambda p: os.path.getmtime(p), reverse=True)
+        if diff:
+            return diff
+        # Fallback: take newest files within time window
+        now = time.time()
+        recent = [p for m, p in after_list if now - m <= seconds_window]
+        return recent[:6]
+
+    def _convert_to_srt_if_needed(self, paths):
+        """Convert any .ass/.ssa in paths to .srt (deletes originals). Returns list of resulting .srt paths (or original path with note on failure)."""
+        srt_paths = []
+        try:
+            import pysubs2
+        except Exception:
+            messagebox.showwarning(
+                "Missing dependency",
+                "To convert ASS/SSA to SRT, please install pysubs2:\n\npip install pysubs2"
+            )
+            return srt_paths
+
+        for p in paths:
+            base, ext = os.path.splitext(p)
+            ext_lower = ext.lower()
+            if ext_lower == ".srt":
+                srt_paths.append(p)
+                continue
+            if ext_lower in (".ass", ".ssa"):
+                try:
+                    subs = pysubs2.load(p, encoding="utf-8")
+                    srt_out = base + ".srt"
+                    subs.save(srt_out, format_="srt")
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
+                    srt_paths.append(srt_out)
+                except Exception as e:
+                    srt_paths.append(p + f" (conversion failed: {e})")
+        return srt_paths
 
     def worker(self):
         if not SUBLIMINAL_AVAILABLE:
@@ -208,7 +271,6 @@ class SubtitleDownloaderApp:
             try:
                 video = Video.fromname(fake_filename)
             except Exception:
-                # fallback
                 try:
                     video = Video.fromname(query + ".mkv")
                 except Exception:
@@ -219,47 +281,105 @@ class SubtitleDownloaderApp:
             os.makedirs(download_dir, exist_ok=True)
 
             try:
-                # Ask subliminal for best subtitles
-                self.update_tree_item(item, status="Searching", message="Querying providers...")
-                results = download_best_subtitles([video] if video is not None else [query], languages, providers=None, hearing_impaired=False)
-                # results: mapping video->list(subtitles)
-                found = False
-                saved_paths = []
-                for v, subs in results.items():
-                    if subs:
-                        # Save subtitles
-                        self.update_tree_item(item, status="Downloading", message="Saving subtitle(s)...")
-                        save_subtitles(v, subs, directory=download_dir)
-                        # find recent subtitle files to show
-                        recent = self._find_recent_subs(download_dir)
-                        for r in recent:
-                            if r not in saved_paths:
-                                saved_paths.append(r)
-                        found = True
-                        break
+                self.update_tree_item(item, status="Searching", message="Querying providers (SRT preferred)...")
+                results = download_best_subtitles([video] if video is not None else [query],
+                                                  languages, providers=None, hearing_impaired=False)
 
-                if found:
-                    # success
-                    msg = "Downloaded"
-                    saved_display = saved_paths[0] if saved_paths else ""
-                    self.update_tree_item(item, status="Downloaded", message=msg, saved_file=saved_display)
-                    if saved_display:
+                # Filter to SRT / SubRip
+                results_srt = {}
+                for v, subs in results.items():
+                    srt_subs = [s for s in subs if getattr(s, "format", "").lower() in ("srt", "subrip")]
+                    if srt_subs:
+                        results_srt[v] = set(srt_subs)  # subliminal expects a set
+
+                if results_srt:
+                    before = self._snapshot_set(download_dir)
+                    self.update_tree_item(item, status="Downloading", message="Saving SRT subtitle(s)...")
+                    # Save the first video’s SRTs
+                    v0 = next(iter(results_srt.keys()))
+                    save_subtitles(v0, results_srt[v0], directory=download_dir)
+                    # give filesystem a tick just in case
+                    time.sleep(0.2)
+                    new_files = self._recent_after_save(before, download_dir)
+
+                    if new_files:
+                        saved_display = new_files[0]
+                        self.update_tree_item(item, status="Downloaded", message="Downloaded SRT", saved_file=saved_display)
                         self.downloads_listbox.insert(tk.END, saved_display)
-                    self.status_var.set(f"Downloaded subtitle for: {query}")
+                        self.status_var.set(f"Downloaded SRT subtitle for: {query}")
+                    else:
+                        # Fallback to a broader scan so we don't mislead the user
+                        recent = [p for _, p in self._list_subs(download_dir)][:1]
+                        if recent:
+                            saved_display = recent[0]
+                            self.update_tree_item(item, status="Downloaded", message="Downloaded (detected by fallback)", saved_file=saved_display)
+                            self.downloads_listbox.insert(tk.END, saved_display)
+                            self.status_var.set(f"Downloaded SRT (fallback detect) for: {query}")
+                        else:
+                            self.update_tree_item(item, status="Error", message="Saved, but could not detect file", saved_file="")
+                            self.status_var.set(f"Saved but could not detect file for: {query}")
+
                 else:
-                    # not found
-                    self.update_tree_item(item, status="Not Found", message="No matching subtitles found", saved_file="")
-                    self.status_var.set(f"No subtitles found for: {query}")
+                    # No SRT available -> show message, then download best available and convert
+                    self.update_tree_item(item, status="Searching", message="SRT not found. Downloading best available...")
+                    self.status_var.set(f"SRT not found for: {query}. Downloading best available...")
+
+                    # If results was empty, re-query once (sometimes providers need a second try)
+                    if not any(results.values()):
+                        results = download_best_subtitles([video] if video is not None else [query],
+                                                          languages, providers=None, hearing_impaired=False)
+
+                    # Save what we have
+                    saved_any = False
+                    before = self._snapshot_set(download_dir)
+                    for v, subs in results.items():
+                        if subs:
+                            self.update_tree_item(item, status="Downloading", message="Saving subtitle(s)...")
+                            save_subtitles(v, set(subs), directory=download_dir)
+                            saved_any = True
+                            break
+
+                    if not saved_any:
+                        self.update_tree_item(item, status="Not Found", message="No matching subtitles found", saved_file="")
+                        self.status_var.set(f"No subtitles found for: {query}")
+                    else:
+                        time.sleep(0.2)
+                        new_files = self._recent_after_save(before, download_dir)
+                        if not new_files:
+                            # last-chance fallback
+                            new_files = [p for _, p in self._list_subs(download_dir)][:3]
+
+                        if not new_files:
+                            self.update_tree_item(item, status="Error", message="Saved, but files not detected", saved_file="")
+                            self.status_var.set(f"Saved but files not detected for: {query}")
+                        else:
+                            # Convert any ASS/SSA to SRT and delete originals
+                            self.update_tree_item(item, status="Converting", message="Converting to SRT...")
+                            converted = self._convert_to_srt_if_needed(new_files)
+                            # Prefer newest SRT
+                            srt_candidates = [p for p in converted if isinstance(p, str) and p.lower().endswith(".srt")]
+                            saved_display = srt_candidates[0] if srt_candidates else (converted[0] if converted else "")
+
+                            if saved_display:
+                                if saved_display.lower().endswith(".srt"):
+                                    self.update_tree_item(item, status="Downloaded", message="SRT not found; converted from other format", saved_file=saved_display)
+                                    self.downloads_listbox.insert(tk.END, saved_display)
+                                    self.status_var.set(f"Downloaded and converted to SRT for: {query}")
+                                else:
+                                    self.update_tree_item(item, status="Partial", message="Conversion failed; original kept", saved_file=saved_display)
+                                    self.downloads_listbox.insert(tk.END, saved_display)
+                                    self.status_var.set(f"Downloaded but conversion failed for: {query}")
+                            else:
+                                self.update_tree_item(item, status="Error", message="Conversion failed; no file", saved_file="")
+                                self.status_var.set(f"Conversion failed for: {query}")
 
             except Exception as ex:
-                # error
                 short_err = str(ex)
                 if len(short_err) > 200:
                     short_err = short_err[:197] + "..."
                 self.update_tree_item(item, status="Error", message=short_err, saved_file="")
                 self.status_var.set(f"Error searching/downloading for: {query}")
 
-            # check stop flag
             if self.stop_flag:
                 break
 
@@ -267,8 +387,8 @@ class SubtitleDownloaderApp:
         self.stop_flag = False
         self.status_var.set("Idle - queue finished")
 
+    # (kept for compatibility if you use it elsewhere)
     def _find_recent_subs(self, folder, ext_list=(".srt", ".ass", ".ssa")):
-        """Return recently modified subtitle files in folder (full paths)"""
         try:
             files = []
             for name in os.listdir(folder):
